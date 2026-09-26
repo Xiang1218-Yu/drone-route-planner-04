@@ -1,26 +1,61 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { planApi } from './api';
 import { distanceBetween, routePoints, validateRoute } from './geometry';
-import type { NoFlyZone, Point, RoutePlan, ValidationResult } from './types';
+import type { NoFlyZone, Point, RoutePlan, ValidationResult, ZoneSchedule, ZoneTimeStatus } from './types';
 
 const CANVAS = { width: 100, height: 70 };
 const ZONE_COLORS = ['#fb7185', '#f59e0b', '#a78bfa', '#38bdf8'];
+const DEFAULT_TIME_ZONE = 'Asia/Shanghai';
+const COMMON_TIME_ZONES = [
+  'Asia/Shanghai', 'Asia/Urumqi', 'Asia/Singapore', 'Asia/Tokyo', 'UTC',
+  'Europe/London', 'Europe/Berlin', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'Australia/Sydney'
+];
+
+const ZONE_STATUS_LABEL: Record<ZoneTimeStatus, string> = {
+  active: '当前有效',
+  'not-yet-active': '尚未生效',
+  expired: '已过期',
+  invalid: '时间无效',
+  unknown: '无法确认'
+};
+
+/** 画布上不同时效状态的区域样式：过期的淡化，未确认的点线警示，有效的保持原样 */
+const ZONE_CANVAS_STYLE: Record<ZoneTimeStatus, { fillOpacity: number; strokeOpacity: number; dash: string }> = {
+  active: { fillOpacity: 0.19, strokeOpacity: 1, dash: '1.5 1' },
+  unknown: { fillOpacity: 0.19, strokeOpacity: 1, dash: '0.6 0.9' },
+  invalid: { fillOpacity: 0.19, strokeOpacity: 1, dash: '0.6 0.9' },
+  'not-yet-active': { fillOpacity: 0.07, strokeOpacity: 0.5, dash: '2.5 1.2' },
+  expired: { fillOpacity: 0.04, strokeOpacity: 0.35, dash: '1.5 1' }
+};
 
 type Tool = 'select' | 'start' | 'end' | 'waypoint' | 'rectangle' | 'polygon';
 
 const initialPlan: RoutePlan = {
   name: '北侧巡检任务',
   canvas: CANVAS,
+  departureTime: '2026-09-26T08:00',
+  departureTimeZone: DEFAULT_TIME_ZONE,
   start: { x: 12, y: 56 },
   end: { x: 87, y: 14 },
   waypoints: [{ x: 33, y: 46 }, { x: 65, y: 28 }],
   noFlyZones: [
-    { id: 'zone-demo', name: '高压线保护区', kind: 'rectangle', points: [{ x: 43, y: 17 }, { x: 64, y: 17 }, { x: 64, y: 38 }, { x: 43, y: 38 }], color: '#fb7185' }
+    {
+      id: 'zone-demo',
+      name: '高压线保护区',
+      kind: 'rectangle',
+      points: [{ x: 43, y: 17 }, { x: 64, y: 17 }, { x: 64, y: 38 }, { x: 43, y: 38 }],
+      color: '#fb7185',
+      schedule: { effectiveFrom: '2026-09-25T20:00', effectiveTo: '2026-09-26T10:00', timeZone: DEFAULT_TIME_ZONE, source: '临时管制通告 A0234/26' }
+    }
   ]
 };
 
 function formatDistance(value: number) {
   return `${value.toFixed(1)} km`;
+}
+
+function formatUtc(iso: string) {
+  return `${iso.slice(0, 16).replace('T', ' ')}Z`;
 }
 
 function pointFromEvent(event: ReactPointerEvent<SVGSVGElement>, svg: SVGSVGElement): Point {
@@ -35,6 +70,11 @@ function pointText(point: Point) {
   return `${point.x.toFixed(1)}, ${point.y.toFixed(1)}`;
 }
 
+function zoneCentroid(zone: NoFlyZone): Point {
+  const total = zone.points.reduce((acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }), { x: 0, y: 0 });
+  return { x: total.x / zone.points.length, y: total.y / zone.points.length };
+}
+
 export default function App() {
   const svgRef = useRef<SVGSVGElement>(null);
   const [plan, setPlan] = useState<RoutePlan>(initialPlan);
@@ -45,6 +85,7 @@ export default function App() {
   const [activePlanId, setActivePlanId] = useState<string>();
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [notice, setNotice] = useState('点击画布或使用左侧工具编辑航线');
+  const [expandedZoneId, setExpandedZoneId] = useState<string>();
 
   useEffect(() => {
     planApi.list().then(({ plans }) => setSavedPlans(plans)).catch(() => setNotice('API 尚未启动，仍可在本地编辑方案'));
@@ -54,8 +95,26 @@ export default function App() {
 
   const points = useMemo(() => routePoints(plan), [plan]);
   const activeSegment = new Set(validation.issues.map((issue) => issue.segmentIndex).filter((index): index is number => index !== undefined));
+  const reportsByZone = useMemo(() => new Map(validation.zoneTimeReports.map((report) => [report.zoneId, report])), [validation]);
 
   const updatePlan = (patch: Partial<RoutePlan>) => setPlan((current) => ({ ...current, ...patch }));
+
+  /** 更新区域时效；首次设置时间时自动带上方案时区，清空所有字段后移除 schedule */
+  const updateZoneSchedule = (zoneId: string, patch: Partial<ZoneSchedule>) => {
+    updatePlan({
+      noFlyZones: plan.noFlyZones.map((zone) => {
+        if (zone.id !== zoneId) return zone;
+        const touchesTime = 'effectiveFrom' in patch || 'effectiveTo' in patch;
+        const merged: ZoneSchedule = {
+          ...(touchesTime ? { timeZone: plan.departureTimeZone ?? DEFAULT_TIME_ZONE } : {}),
+          ...zone.schedule,
+          ...patch
+        };
+        const cleaned = Object.fromEntries(Object.entries(merged).filter(([, value]) => value !== undefined && value !== '')) as ZoneSchedule;
+        return { ...zone, schedule: Object.keys(cleaned).length > 0 ? cleaned : undefined };
+      })
+    });
+  };
 
   const handleCanvasClick = (event: ReactPointerEvent<SVGSVGElement>) => {
     if (!svgRef.current) return;
@@ -85,12 +144,14 @@ export default function App() {
       name: `禁飞区 ${index + 1}`,
       kind: 'polygon',
       points: draftPolygon,
-      color: ZONE_COLORS[index % ZONE_COLORS.length]
+      color: ZONE_COLORS[index % ZONE_COLORS.length],
+      schedule: { timeZone: plan.departureTimeZone ?? DEFAULT_TIME_ZONE }
     };
     updatePlan({ noFlyZones: [...plan.noFlyZones, zone] });
     setDraftPolygon([]);
     setTool('select');
-    setNotice(`已创建 ${zone.name}`);
+    setExpandedZoneId(zone.id);
+    setNotice(`已创建 ${zone.name}，可在侧栏配置生效时间`);
   };
 
   const handleRectangle = (event: ReactPointerEvent<SVGSVGElement>) => {
@@ -106,11 +167,13 @@ export default function App() {
       name: `矩形禁飞区 ${index + 1}`,
       kind: 'rectangle',
       points: [{ x, y }, { x: x + width, y }, { x: x + width, y: y + height }, { x, y: y + height }],
-      color: ZONE_COLORS[index % ZONE_COLORS.length]
+      color: ZONE_COLORS[index % ZONE_COLORS.length],
+      schedule: { timeZone: plan.departureTimeZone ?? DEFAULT_TIME_ZONE }
     };
     updatePlan({ noFlyZones: [...plan.noFlyZones, zone] });
     setTool('select');
-    setNotice(`已创建 ${zone.name}`);
+    setExpandedZoneId(zone.id);
+    setNotice(`已创建 ${zone.name}，可在侧栏配置生效时间`);
   };
 
   const handlePointerUp = (event: ReactPointerEvent<SVGSVGElement>) => {
@@ -140,13 +203,15 @@ export default function App() {
     setPlan(saved);
     setActivePlanId(saved.id);
     setDraftPolygon([]);
+    setExpandedZoneId(undefined);
     setNotice(`已加载「${saved.name}」`);
   };
 
   const newPlan = () => {
-    setPlan({ ...initialPlan, name: '未命名航线', id: undefined, waypoints: [], noFlyZones: [] });
+    setPlan({ ...initialPlan, name: '未命名航线', id: undefined, waypoints: [], noFlyZones: [], departureTime: undefined, departureTimeZone: DEFAULT_TIME_ZONE });
     setActivePlanId(undefined);
     setDraftPolygon([]);
+    setExpandedZoneId(undefined);
     setNotice('已新建空白方案');
   };
 
@@ -182,6 +247,20 @@ export default function App() {
           </section>
 
           <section className="side-section">
+            <div className="section-title"><span>起飞时间</span><small>{validation.evaluatedAt ? '已换算 UTC' : '未设置'}</small></div>
+            <label className="field-label">计划起飞
+              <input type="datetime-local" className="field-input" value={plan.departureTime ?? ''} onChange={(event) => updatePlan({ departureTime: event.target.value || undefined })} />
+            </label>
+            <label className="field-label">时区
+              <input className="field-input" list="timezone-options" placeholder={`如 ${DEFAULT_TIME_ZONE}`} value={plan.departureTimeZone ?? ''} onChange={(event) => updatePlan({ departureTimeZone: event.target.value || undefined })} />
+            </label>
+            <datalist id="timezone-options">{COMMON_TIME_ZONES.map((timeZone) => <option key={timeZone} value={timeZone} />)}</datalist>
+            {validation.evaluatedAt
+              ? <div className="subtle-text">对应 UTC 时刻 {formatUtc(validation.evaluatedAt)}</div>
+              : <div className="subtle-text">未设置起飞时间时，所有区域时效均按「无法确认」处理</div>}
+          </section>
+
+          <section className="side-section">
             <div className="section-title"><span>编辑工具</span><small>{tool === 'polygon' ? '绘制中' : '选择操作'}</small></div>
             <div className="tool-grid">
               {toolItems.map((item) => <button key={item.id} className={`tool-button ${tool === item.id ? 'active' : ''}`} onClick={() => { setTool(item.id); if (item.id !== 'polygon') setDraftPolygon([]); }} title={item.hint}><b>{item.icon}</b><span>{item.label}</span></button>)}
@@ -200,7 +279,40 @@ export default function App() {
           <section className="side-section">
             <div className="section-title"><span>禁飞区</span><strong>{plan.noFlyZones.length}</strong></div>
             {plan.noFlyZones.length === 0 && <div className="empty-row">暂无禁飞区</div>}
-            {plan.noFlyZones.map((zone) => <div className="zone-row" key={zone.id}><span className="zone-swatch" style={{ background: zone.color }} /><div><b>{zone.name}</b><small>{zone.kind === 'rectangle' ? '矩形区域' : `${zone.points.length} 边形区域`}</small></div><button className="remove-button" onClick={() => removeZone(zone.id)}>×</button></div>)}
+            {plan.noFlyZones.map((zone) => {
+              const report = reportsByZone.get(zone.id);
+              const expanded = expandedZoneId === zone.id;
+              return (
+                <div className="zone-item" key={zone.id}>
+                  <div className="zone-row" onClick={() => setExpandedZoneId(expanded ? undefined : zone.id)}>
+                    <span className="zone-swatch" style={{ background: zone.color }} />
+                    <div>
+                      <b>{zone.name}</b>
+                      <small>{zone.kind === 'rectangle' ? '矩形区域' : `${zone.points.length} 边形区域`}{report ? ` · ${ZONE_STATUS_LABEL[report.status]}` : ''}</small>
+                    </div>
+                    <button className="remove-button" onClick={(event) => { event.stopPropagation(); removeZone(zone.id); }}>×</button>
+                  </div>
+                  {expanded && (
+                    <div className="zone-schedule">
+                      <label className="field-label">生效时间
+                        <input type="datetime-local" className="field-input" value={zone.schedule?.effectiveFrom ?? ''} onChange={(event) => updateZoneSchedule(zone.id, { effectiveFrom: event.target.value || undefined })} />
+                      </label>
+                      <label className="field-label">失效时间
+                        <input type="datetime-local" className="field-input" value={zone.schedule?.effectiveTo ?? ''} onChange={(event) => updateZoneSchedule(zone.id, { effectiveTo: event.target.value || undefined })} />
+                      </label>
+                      <label className="field-label">时区
+                        <input className="field-input" list="timezone-options" placeholder={`如 ${DEFAULT_TIME_ZONE}`} value={zone.schedule?.timeZone ?? ''} onChange={(event) => updateZoneSchedule(zone.id, { timeZone: event.target.value || undefined })} />
+                      </label>
+                      <label className="field-label">来源说明
+                        <input className="field-input" placeholder="如 NOTAM 编号、管制通告" value={zone.schedule?.source ?? ''} onChange={(event) => updateZoneSchedule(zone.id, { source: event.target.value || undefined })} />
+                      </label>
+                      {report && <div className="schedule-hint">{report.reason}</div>}
+                      {!zone.schedule?.effectiveFrom && !zone.schedule?.effectiveTo && <div className="schedule-hint">未配置时间将按「无法确认」处理，不会视为永不过期</div>}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </section>
 
           <section className="side-section saved-section">
@@ -221,7 +333,18 @@ export default function App() {
               </defs>
               <rect width={CANVAS.width} height={CANVAS.height} fill="#f7fbfa" />
               <rect width={CANVAS.width} height={CANVAS.height} fill="url(#majorGrid)" />
-              {plan.noFlyZones.map((zone) => <polygon key={zone.id} points={zone.points.map((point) => `${point.x},${point.y}`).join(' ')} fill={zone.color} fillOpacity="0.19" stroke={zone.color} strokeWidth="0.7" strokeDasharray="1.5 1" />)}
+              {plan.noFlyZones.map((zone) => {
+                const report = reportsByZone.get(zone.id);
+                const status = report?.status ?? 'unknown';
+                const style = ZONE_CANVAS_STYLE[status];
+                const centroid = zoneCentroid(zone);
+                return (
+                  <g key={zone.id}>
+                    <polygon points={zone.points.map((point) => `${point.x},${point.y}`).join(' ')} fill={zone.color} fillOpacity={style.fillOpacity} stroke={zone.color} strokeOpacity={style.strokeOpacity} strokeWidth="0.7" strokeDasharray={style.dash} />
+                    {status !== 'active' && <text x={centroid.x} y={centroid.y} textAnchor="middle" fontSize="2.2" fontWeight="700" fill="#7a8f8c">{ZONE_STATUS_LABEL[status]}</text>}
+                  </g>
+                );
+              })}
               {draftPolygon.length > 0 && <><polyline points={draftPolygon.map((point) => `${point.x},${point.y}`).join(' ')} fill="none" stroke="#0f766e" strokeWidth="0.65" strokeDasharray="1.5 1" />{draftPolygon.map((point, index) => <circle key={index} cx={point.x} cy={point.y} r="1.15" fill="#0f766e" />)}</>}
               {points.slice(1).map((point, index) => <line key={index} x1={points[index].x} y1={points[index].y} x2={point.x} y2={point.y} stroke={activeSegment.has(index) ? '#ef4444' : '#0e7490'} strokeWidth={activeSegment.has(index) ? '1.1' : '0.85'} strokeLinecap="round" strokeDasharray={activeSegment.has(index) ? '2 1' : undefined} filter={activeSegment.has(index) ? undefined : 'url(#routeGlow)'} />)}
               {plan.waypoints.map((point, index) => <g key={`${point.x}-${point.y}-${index}`}><circle cx={point.x} cy={point.y} r="2" fill="#ffffff" stroke="#0e7490" strokeWidth="0.7" /><text x={point.x} y={point.y + 0.7} textAnchor="middle" fontSize="1.8" fontWeight="700" fill="#0e7490">{index + 1}</text></g>)}
@@ -231,7 +354,7 @@ export default function App() {
               {[0, 10, 20, 30, 40, 50, 60, 70].map((value) => <text key={`y-${value}`} x={-1.5} y={CANVAS.height - value + 0.8} textAnchor="end" fontSize="2.3" fill="#648383">{value}</text>)}
             </svg>
             <div className="canvas-compass"><span>北</span><b>↑</b></div>
-            <div className="canvas-legend"><span><i className="legend-line" />规划航线</span><span><i className="legend-zone" />禁飞区</span><span><i className="legend-risk" />风险航段</span></div>
+            <div className="canvas-legend"><span><i className="legend-line" />规划航线</span><span><i className="legend-zone" />禁飞区</span><span><i className="legend-zone legend-zone-unknown" />时效未确认</span><span><i className="legend-zone legend-zone-faded" />未生效/已过期</span><span><i className="legend-risk" />风险航段</span></div>
           </div>
           <div className="canvas-footer"><span>{notice}</span><span>提示：所有坐标均以左下角为原点</span></div>
         </section>
@@ -239,6 +362,20 @@ export default function App() {
         <aside className="inspector">
           <section className="metric-card primary-metric"><div className="metric-label">航线总距离</div><div className="metric-value">{formatDistance(validation.distance)}</div><div className="metric-caption">{points.length - 1} 个航段 · 预计 18 分钟</div><div className="metric-spark"><span style={{ height: '35%' }} /><span style={{ height: '55%' }} /><span style={{ height: '42%' }} /><span style={{ height: '75%' }} /><span style={{ height: '65%' }} /><span style={{ height: '92%' }} /><span style={{ height: '78%' }} /><span style={{ height: '100%' }} /></div></section>
           <section className={`validation-card ${validation.valid ? 'is-valid' : 'has-error'}`}><div className="validation-heading"><span className="validation-icon">{validation.valid ? '✓' : '!'}</span><div><b>{validation.valid ? '校验通过' : '需要调整'}</b><small>{validation.valid ? '未发现越界或穿越禁飞区' : '请查看下方风险项'}</small></div></div>{validation.issues.length > 0 && <div className="issue-list">{validation.issues.slice(0, 4).map((issue, index) => <div className="issue-item" key={`${issue.message}-${index}`}><span>×</span>{issue.message}</div>)}</div>}</section>
+          <section className="inspector-section">
+            <div className="section-title"><span>空域时效</span><small>{validation.evaluatedAt ? `起飞 ${formatUtc(validation.evaluatedAt)}` : '未设置起飞时间'}</small></div>
+            {validation.zoneTimeReports.length === 0 && <div className="empty-row">暂无禁飞区</div>}
+            {validation.zoneTimeReports.map((report) => (
+              <div className="time-report" key={report.zoneId}>
+                <span className={`time-badge status-${report.status}`}>{ZONE_STATUS_LABEL[report.status]}</span>
+                <div>
+                  <b>{report.zoneName}{report.enforced ? '' : ' · 本次不拦截'}</b>
+                  <small>{report.reason}</small>
+                  {report.source && <small>来源：{report.source}</small>}
+                </div>
+              </div>
+            ))}
+          </section>
           <section className="inspector-section"><div className="section-title"><span>航线摘要</span><small>实时计算</small></div><div className="summary-list"><div><span>起点</span><b>{pointText(plan.start)}</b></div><div><span>终点</span><b>{pointText(plan.end)}</b></div><div><span>航点</span><b>{plan.waypoints.length} 个</b></div><div><span>禁飞区</span><b>{plan.noFlyZones.length} 个</b></div></div></section>
           <section className="inspector-section"><div className="section-title"><span>快捷操作</span></div><button className="outline-action" onClick={() => { updatePlan({ waypoints: [] }); setNotice('已清空所有航点'); }}>清空航点</button><button className="outline-action" onClick={() => { updatePlan({ noFlyZones: [] }); setNotice('已移除所有禁飞区'); }}>移除禁飞区</button><button className="outline-action" onClick={() => setValidation(validateRoute(plan))}>重新校验路径 <span>⌘↵</span></button></section>
           <section className="api-note"><div className="api-icon">⌁</div><div><b>内存 REST API</b><small>保存到当前 Node.js 进程，重启后清空</small></div></section>

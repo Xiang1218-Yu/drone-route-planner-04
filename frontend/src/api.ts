@@ -18,5 +18,10 @@ export const planApi = {
     method: 'POST',
     body: JSON.stringify(plan)
   }),
+  /** 只校验不保存：后端按方案中的起飞时间返回带时效说明的校验结果 */
+  validate: (plan: RoutePlan) => api<{ validation: ValidationResult }>('/api/validate', {
+    method: 'POST',
+    body: JSON.stringify(plan)
+  }),
   remove: (id: string) => api<void>(`/api/plans/${id}`, { method: 'DELETE' })
 };

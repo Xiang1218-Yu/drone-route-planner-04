@@ -1,3 +1,4 @@
+import { evaluateZoneSchedule, resolveDepartureInstant } from './timeRules';
 import type { NoFlyZone, Point, RoutePlan, ValidationResult } from './types';
 
 const epsilon = 1e-8;
@@ -40,6 +41,11 @@ const segmentIntersectsZone = (start: Point, end: Point, zone: NoFlyZone) => {
 export function validateRoute(plan: RoutePlan): ValidationResult {
   const points = routePoints(plan);
   const issues: ValidationResult['issues'] = [];
+  const departure = resolveDepartureInstant(plan);
+  const departureUtcMs = departure.instant?.utcMs ?? null;
+  const zoneTimeReports = plan.noFlyZones.map((zone) => evaluateZoneSchedule(zone, departureUtcMs, departure.error));
+  const reportsByZone = new Map(zoneTimeReports.map((report) => [report.zoneId, report]));
+
   points.forEach((point, index) => {
     if (point.x < 0 || point.x > plan.canvas.width || point.y < 0 || point.y > plan.canvas.height) {
       issues.push({ type: 'out-of-bounds', message: `节点 ${index + 1} 超出画布范围` });
@@ -47,10 +53,26 @@ export function validateRoute(plan: RoutePlan): ValidationResult {
   });
   points.slice(1).forEach((point, segmentIndex) => {
     plan.noFlyZones.forEach((zone) => {
+      const report = reportsByZone.get(zone.id);
+      // 明确尚未生效或已过期的区域不拦截；有效、无法确认、时间无效的区域一律拦截
+      if (report && !report.enforced) return;
       if (segmentIntersectsZone(points[segmentIndex], point, zone)) {
-        issues.push({ type: 'no-fly-zone', message: `航段 ${segmentIndex + 1} 穿越禁飞区「${zone.name}」`, segmentIndex, zoneId: zone.id });
+        const unconfirmed = !report || report.status !== 'active';
+        issues.push({
+          type: 'no-fly-zone',
+          message: `航段 ${segmentIndex + 1} 穿越禁飞区「${zone.name}」${unconfirmed ? '（时效未确认，按有效处理）' : ''}`,
+          segmentIndex,
+          zoneId: zone.id,
+          timeStatus: report?.status
+        });
       }
     });
   });
-  return { valid: issues.length === 0, distance: routeDistance(points), issues };
+  return {
+    valid: issues.length === 0,
+    distance: routeDistance(points),
+    issues,
+    evaluatedAt: departure.instant ? new Date(departure.instant.utcMs).toISOString() : undefined,
+    zoneTimeReports
+  };
 }
