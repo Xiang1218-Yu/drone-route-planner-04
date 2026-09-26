@@ -1,0 +1,5 @@
+{
+  "name": "drone-route-planner-backend",
+  "private": true,
+  "type": "module"
+}
