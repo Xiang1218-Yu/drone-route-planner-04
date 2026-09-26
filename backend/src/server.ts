@@ -38,10 +38,33 @@ app.post('/api/plans', (req: Request<unknown, unknown, Partial<RoutePlan>>, res:
     start: body.start,
     end: body.end,
     waypoints: Array.isArray(body.waypoints) ? body.waypoints : [],
-    noFlyZones: Array.isArray(body.noFlyZones) ? body.noFlyZones : []
+    noFlyZones: Array.isArray(body.noFlyZones) ? body.noFlyZones : [],
+    departureTime: typeof body.departureTime === 'string' && body.departureTime.trim() !== '' ? body.departureTime : undefined
   });
 
   return res.status(body.id ? 200 : 201).json({ plan, validation: validateRoute(plan) });
+});
+
+// 不落盘校验：值班人员可传入方案与计划起飞时间（departureTime 可覆盖方案内值），
+// 直接查询某个起飞窗口下路线是否可用。
+app.post('/api/plans/validate', (req: Request<unknown, unknown, Partial<RoutePlan>>, res: Response) => {
+  const body = req.body;
+  if (!body || !body.canvas || !body.start || !body.end) {
+    return res.status(400).json({ message: 'canvas、start、end 为必填字段' });
+  }
+  const plan: RoutePlan = {
+    id: typeof body.id === 'string' ? body.id : 'preview',
+    name: typeof body.name === 'string' ? body.name : '未命名方案',
+    createdAt: typeof body.createdAt === 'string' ? body.createdAt : '',
+    updatedAt: typeof body.updatedAt === 'string' ? body.updatedAt : '',
+    canvas: body.canvas,
+    start: body.start,
+    end: body.end,
+    waypoints: Array.isArray(body.waypoints) ? body.waypoints : [],
+    noFlyZones: Array.isArray(body.noFlyZones) ? body.noFlyZones : [],
+    departureTime: typeof body.departureTime === 'string' && body.departureTime.trim() !== '' ? body.departureTime : undefined
+  };
+  return res.json({ validation: validateRoute(plan) });
 });
 
 app.delete('/api/plans/:id', (req, res) => {

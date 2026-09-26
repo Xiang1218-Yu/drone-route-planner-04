@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { planApi } from './api';
 import { distanceBetween, routePoints, validateRoute } from './geometry';
-import type { NoFlyZone, Point, RoutePlan, ValidationResult } from './types';
+import type { NoFlyZone, Point, RoutePlan, ValidationResult, ZoneTimeEvaluation, ZoneTimeStatus, ZoneTimeWindow } from './types';
 
 const CANVAS = { width: 100, height: 70 };
 const ZONE_COLORS = ['#fb7185', '#f59e0b', '#a78bfa', '#38bdf8'];
@@ -14,8 +14,19 @@ const initialPlan: RoutePlan = {
   start: { x: 12, y: 56 },
   end: { x: 87, y: 14 },
   waypoints: [{ x: 33, y: 46 }, { x: 65, y: 28 }],
+  departureTime: '2026-09-26T23:30:00+08:00',
   noFlyZones: [
-    { id: 'zone-demo', name: '高压线保护区', kind: 'rectangle', points: [{ x: 43, y: 17 }, { x: 64, y: 17 }, { x: 64, y: 38 }, { x: 43, y: 38 }], color: '#fb7185' }
+    {
+      id: 'zone-demo',
+      name: '高压线保护区',
+      kind: 'rectangle',
+      points: [{ x: 43, y: 17 }, { x: 64, y: 17 }, { x: 64, y: 38 }, { x: 43, y: 38 }],
+      color: '#fb7185',
+      timeWindows: [
+        { effectiveFrom: '2026-09-26T22:00', effectiveUntil: '2026-09-27T02:00', timezone: 'Asia/Shanghai', source: 'NOTAM A0124 夜间施工' },
+        { effectiveFrom: '2026-09-20T08:00', effectiveUntil: '2026-09-21T08:00', timezone: 'Asia/Shanghai', source: '临时演练（已结束）' }
+      ]
+    }
   ]
 };
 
@@ -35,6 +46,35 @@ function pointText(point: Point) {
   return `${point.x.toFixed(1)}, ${point.y.toFixed(1)}`;
 }
 
+const BROWSER_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+/** 存储的 ISO 时间（带偏移）→ datetime-local 输入框值（浏览器本地墙钟） */
+function isoToInputValue(iso?: string) {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** datetime-local 输入框值 → 带偏移的 ISO 时间；清空返回 undefined（不静默当作永久有效） */
+function inputValueToIso(value: string): string | undefined {
+  if (!value) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function zoneCentroid(zone: NoFlyZone): Point {
+  const sum = zone.points.reduce((acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }), { x: 0, y: 0 });
+  return { x: sum.x / zone.points.length, y: sum.y / zone.points.length };
+}
+
+const ZONE_STATUS_META: Record<ZoneTimeStatus, { label: string; className: string }> = {
+  active: { label: '生效中', className: 'is-active' },
+  inactive: { label: '未生效', className: 'is-inactive' },
+  unknown: { label: '待确认', className: 'is-unknown' }
+};
+
 export default function App() {
   const svgRef = useRef<SVGSVGElement>(null);
   const [plan, setPlan] = useState<RoutePlan>(initialPlan);
@@ -45,6 +85,7 @@ export default function App() {
   const [activePlanId, setActivePlanId] = useState<string>();
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [notice, setNotice] = useState('点击画布或使用左侧工具编辑航线');
+  const [expandedZoneId, setExpandedZoneId] = useState<string | null>(null);
 
   useEffect(() => {
     planApi.list().then(({ plans }) => setSavedPlans(plans)).catch(() => setNotice('API 尚未启动，仍可在本地编辑方案'));
@@ -54,6 +95,11 @@ export default function App() {
 
   const points = useMemo(() => routePoints(plan), [plan]);
   const activeSegment = new Set(validation.issues.map((issue) => issue.segmentIndex).filter((index): index is number => index !== undefined));
+  const zoneStatus = useMemo(() => {
+    const map = new Map<string, ZoneTimeEvaluation>();
+    [...validation.zones.active, ...validation.zones.inactive, ...validation.zones.unknown].forEach((evaluation) => map.set(evaluation.zoneId, evaluation));
+    return map;
+  }, [validation]);
 
   const updatePlan = (patch: Partial<RoutePlan>) => setPlan((current) => ({ ...current, ...patch }));
 
@@ -120,6 +166,14 @@ export default function App() {
   const removeWaypoint = (index: number) => updatePlan({ waypoints: plan.waypoints.filter((_, waypointIndex) => waypointIndex !== index) });
   const removeZone = (id: string) => updatePlan({ noFlyZones: plan.noFlyZones.filter((zone) => zone.id !== id) });
 
+  const updateZoneWindows = (zoneId: string, updater: (windows: ZoneTimeWindow[]) => ZoneTimeWindow[]) => {
+    updatePlan({ noFlyZones: plan.noFlyZones.map((zone) => (zone.id === zoneId ? { ...zone, timeWindows: updater(zone.timeWindows ?? []) } : zone)) });
+  };
+  const addZoneWindow = (zoneId: string) => updateZoneWindows(zoneId, (windows) => [...windows, { timezone: BROWSER_TIMEZONE, source: '' }]);
+  const updateZoneWindow = (zoneId: string, index: number, patch: Partial<ZoneTimeWindow>) =>
+    updateZoneWindows(zoneId, (windows) => windows.map((window, windowIndex) => (windowIndex === index ? { ...window, ...patch } : window)));
+  const removeZoneWindow = (zoneId: string, index: number) => updateZoneWindows(zoneId, (windows) => windows.filter((_, windowIndex) => windowIndex !== index));
+
   const save = async () => {
     setSaveState('saving');
     try {
@@ -140,13 +194,15 @@ export default function App() {
     setPlan(saved);
     setActivePlanId(saved.id);
     setDraftPolygon([]);
+    setExpandedZoneId(null);
     setNotice(`已加载「${saved.name}」`);
   };
 
   const newPlan = () => {
-    setPlan({ ...initialPlan, name: '未命名航线', id: undefined, waypoints: [], noFlyZones: [] });
+    setPlan({ ...initialPlan, name: '未命名航线', id: undefined, waypoints: [], noFlyZones: [], departureTime: undefined });
     setActivePlanId(undefined);
     setDraftPolygon([]);
+    setExpandedZoneId(null);
     setNotice('已新建空白方案');
   };
 
@@ -179,6 +235,11 @@ export default function App() {
             <div className="section-eyebrow">当前任务</div>
             <input className="plan-name" value={plan.name} onChange={(event) => updatePlan({ name: event.target.value })} aria-label="方案名称" />
             <div className="subtle-text">二维航线 · 坐标单位 km</div>
+            <label className="departure-field">
+              <span>计划起飞时间</span>
+              <input type="datetime-local" value={isoToInputValue(plan.departureTime)} onChange={(event) => updatePlan({ departureTime: inputValueToIso(event.target.value) })} aria-label="计划起飞时间" />
+            </label>
+            {!plan.departureTime && <div className="departure-warning">未设置起飞时间，带时间窗口的禁飞区将无法确认</div>}
           </section>
 
           <section className="side-section">
@@ -200,7 +261,38 @@ export default function App() {
           <section className="side-section">
             <div className="section-title"><span>禁飞区</span><strong>{plan.noFlyZones.length}</strong></div>
             {plan.noFlyZones.length === 0 && <div className="empty-row">暂无禁飞区</div>}
-            {plan.noFlyZones.map((zone) => <div className="zone-row" key={zone.id}><span className="zone-swatch" style={{ background: zone.color }} /><div><b>{zone.name}</b><small>{zone.kind === 'rectangle' ? '矩形区域' : `${zone.points.length} 边形区域`}</small></div><button className="remove-button" onClick={() => removeZone(zone.id)}>×</button></div>)}
+            {plan.noFlyZones.map((zone) => {
+              const evaluation = zoneStatus.get(zone.id);
+              const meta = ZONE_STATUS_META[evaluation?.status ?? 'unknown'];
+              const expanded = expandedZoneId === zone.id;
+              const windows = zone.timeWindows ?? [];
+              return (
+                <div className="zone-item" key={zone.id}>
+                  <div className="zone-row">
+                    <span className="zone-swatch" style={{ background: zone.color }} />
+                    <div><b>{zone.name}</b><small>{zone.kind === 'rectangle' ? '矩形区域' : `${zone.points.length} 边形区域`} · {windows.length > 0 ? `${windows.length} 个时间窗口` : '未配置时间'}</small></div>
+                    <span className={`zone-status-chip ${meta.className}`} title={evaluation?.reasons.join('\n')}>{meta.label}</span>
+                    <button className={`zone-time-toggle ${expanded ? 'open' : ''}`} onClick={() => setExpandedZoneId(expanded ? null : zone.id)} title="编辑生效时间窗口">⏱</button>
+                    <button className="remove-button" onClick={() => removeZone(zone.id)}>×</button>
+                  </div>
+                  {expanded && (
+                    <div className="zone-time-editor">
+                      {windows.map((window, index) => (
+                        <div className="time-window" key={index}>
+                          <div className="time-window-head"><span>窗口 {index + 1}</span><button className="remove-button inline" onClick={() => removeZoneWindow(zone.id, index)}>×</button></div>
+                          <label>来源说明<input type="text" placeholder="如 NOTAM 编号 / 通告" value={window.source ?? ''} onChange={(event) => updateZoneWindow(zone.id, index, { source: event.target.value })} /></label>
+                          <label>时区<input type="text" placeholder="如 Asia/Shanghai" value={window.timezone ?? ''} onChange={(event) => updateZoneWindow(zone.id, index, { timezone: event.target.value })} /></label>
+                          <label>生效时间<input type="datetime-local" value={window.effectiveFrom ?? ''} onChange={(event) => updateZoneWindow(zone.id, index, { effectiveFrom: event.target.value || undefined })} /></label>
+                          <label>失效时间<input type="datetime-local" value={window.effectiveUntil ?? ''} onChange={(event) => updateZoneWindow(zone.id, index, { effectiveUntil: event.target.value || undefined })} /></label>
+                        </div>
+                      ))}
+                      {windows.length === 0 && <div className="empty-row">未配置时间：校验时将列为「无法确认」，不会当作永久有效</div>}
+                      <button className="add-window-button" onClick={() => addZoneWindow(zone.id)}>＋ 添加时间窗口</button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </section>
 
           <section className="side-section saved-section">
@@ -221,7 +313,29 @@ export default function App() {
               </defs>
               <rect width={CANVAS.width} height={CANVAS.height} fill="#f7fbfa" />
               <rect width={CANVAS.width} height={CANVAS.height} fill="url(#majorGrid)" />
-              {plan.noFlyZones.map((zone) => <polygon key={zone.id} points={zone.points.map((point) => `${point.x},${point.y}`).join(' ')} fill={zone.color} fillOpacity="0.19" stroke={zone.color} strokeWidth="0.7" strokeDasharray="1.5 1" />)}
+              {plan.noFlyZones.map((zone) => {
+                const status = zoneStatus.get(zone.id)?.status ?? 'unknown';
+                const center = zoneCentroid(zone);
+                return (
+                  <g key={zone.id}>
+                    <polygon
+                      points={zone.points.map((point) => `${point.x},${point.y}`).join(' ')}
+                      fill={zone.color}
+                      fillOpacity={status === 'active' ? 0.19 : status === 'unknown' ? 0.1 : 0.05}
+                      stroke={status === 'unknown' ? '#d97706' : zone.color}
+                      strokeOpacity={status === 'inactive' ? 0.45 : 1}
+                      strokeWidth="0.7"
+                      strokeDasharray={status === 'inactive' ? '1 1.4' : '1.5 1'}
+                    />
+                    {status !== 'active' && (
+                      <g>
+                        <circle cx={center.x} cy={center.y} r="2.1" fill="#ffffff" stroke={status === 'unknown' ? '#d97706' : '#94a3b8'} strokeWidth="0.45" />
+                        <text x={center.x} y={center.y + 0.9} textAnchor="middle" fontSize="2.4" fontWeight="800" fill={status === 'unknown' ? '#d97706' : '#94a3b8'}>{status === 'unknown' ? '?' : '◷'}</text>
+                      </g>
+                    )}
+                  </g>
+                );
+              })}
               {draftPolygon.length > 0 && <><polyline points={draftPolygon.map((point) => `${point.x},${point.y}`).join(' ')} fill="none" stroke="#0f766e" strokeWidth="0.65" strokeDasharray="1.5 1" />{draftPolygon.map((point, index) => <circle key={index} cx={point.x} cy={point.y} r="1.15" fill="#0f766e" />)}</>}
               {points.slice(1).map((point, index) => <line key={index} x1={points[index].x} y1={points[index].y} x2={point.x} y2={point.y} stroke={activeSegment.has(index) ? '#ef4444' : '#0e7490'} strokeWidth={activeSegment.has(index) ? '1.1' : '0.85'} strokeLinecap="round" strokeDasharray={activeSegment.has(index) ? '2 1' : undefined} filter={activeSegment.has(index) ? undefined : 'url(#routeGlow)'} />)}
               {plan.waypoints.map((point, index) => <g key={`${point.x}-${point.y}-${index}`}><circle cx={point.x} cy={point.y} r="2" fill="#ffffff" stroke="#0e7490" strokeWidth="0.7" /><text x={point.x} y={point.y + 0.7} textAnchor="middle" fontSize="1.8" fontWeight="700" fill="#0e7490">{index + 1}</text></g>)}
@@ -231,15 +345,30 @@ export default function App() {
               {[0, 10, 20, 30, 40, 50, 60, 70].map((value) => <text key={`y-${value}`} x={-1.5} y={CANVAS.height - value + 0.8} textAnchor="end" fontSize="2.3" fill="#648383">{value}</text>)}
             </svg>
             <div className="canvas-compass"><span>北</span><b>↑</b></div>
-            <div className="canvas-legend"><span><i className="legend-line" />规划航线</span><span><i className="legend-zone" />禁飞区</span><span><i className="legend-risk" />风险航段</span></div>
+            <div className="canvas-legend"><span><i className="legend-line" />规划航线</span><span><i className="legend-zone" />生效中区域</span><span><i className="legend-zone inactive" />已过期区域</span><span><i className="legend-zone unknown" />时间待确认</span><span><i className="legend-risk" />风险航段</span></div>
           </div>
           <div className="canvas-footer"><span>{notice}</span><span>提示：所有坐标均以左下角为原点</span></div>
         </section>
 
         <aside className="inspector">
           <section className="metric-card primary-metric"><div className="metric-label">航线总距离</div><div className="metric-value">{formatDistance(validation.distance)}</div><div className="metric-caption">{points.length - 1} 个航段 · 预计 18 分钟</div><div className="metric-spark"><span style={{ height: '35%' }} /><span style={{ height: '55%' }} /><span style={{ height: '42%' }} /><span style={{ height: '75%' }} /><span style={{ height: '65%' }} /><span style={{ height: '92%' }} /><span style={{ height: '78%' }} /><span style={{ height: '100%' }} /></div></section>
-          <section className={`validation-card ${validation.valid ? 'is-valid' : 'has-error'}`}><div className="validation-heading"><span className="validation-icon">{validation.valid ? '✓' : '!'}</span><div><b>{validation.valid ? '校验通过' : '需要调整'}</b><small>{validation.valid ? '未发现越界或穿越禁飞区' : '请查看下方风险项'}</small></div></div>{validation.issues.length > 0 && <div className="issue-list">{validation.issues.slice(0, 4).map((issue, index) => <div className="issue-item" key={`${issue.message}-${index}`}><span>×</span>{issue.message}</div>)}</div>}</section>
-          <section className="inspector-section"><div className="section-title"><span>航线摘要</span><small>实时计算</small></div><div className="summary-list"><div><span>起点</span><b>{pointText(plan.start)}</b></div><div><span>终点</span><b>{pointText(plan.end)}</b></div><div><span>航点</span><b>{plan.waypoints.length} 个</b></div><div><span>禁飞区</span><b>{plan.noFlyZones.length} 个</b></div></div></section>
+          <section className={`validation-card ${validation.valid ? 'is-valid' : 'has-error'}`}>
+            <div className="validation-heading"><span className="validation-icon">{validation.valid ? '✓' : '!'}</span><div><b>{validation.valid ? '校验通过' : '需要调整'}</b><small>{validation.valid ? '未发现越界或穿越生效中的禁飞区' : '请查看下方风险项'}</small></div></div>
+            {plan.noFlyZones.length > 0 && (
+              <div className="zone-time-summary">
+                {validation.zones.active.length > 0 && <div className="time-bucket active"><b>生效中 {validation.zones.active.length}</b><span>{validation.zones.active.map((evaluation) => evaluation.zoneName).join('、')}</span></div>}
+                {validation.zones.inactive.length > 0 && <div className="time-bucket inactive"><b>已过期/未生效 {validation.zones.inactive.length}</b><span>{validation.zones.inactive.map((evaluation) => evaluation.zoneName).join('、')}</span></div>}
+                {validation.zones.unknown.length > 0 && (
+                  <div className="time-bucket unknown">
+                    <b>无法确认 {validation.zones.unknown.length}</b>
+                    {validation.zones.unknown.map((evaluation) => <span key={evaluation.zoneId}>{evaluation.zoneName}：{evaluation.reasons[0]}</span>)}
+                  </div>
+                )}
+              </div>
+            )}
+            {validation.issues.length > 0 && <div className="issue-list">{validation.issues.slice(0, 4).map((issue, index) => <div className={`issue-item ${issue.type === 'no-fly-zone-unconfirmed' ? 'unconfirmed' : ''}`} key={`${issue.message}-${index}`}><span>×</span>{issue.message}</div>)}</div>}
+          </section>
+          <section className="inspector-section"><div className="section-title"><span>航线摘要</span><small>实时计算</small></div><div className="summary-list"><div><span>起点</span><b>{pointText(plan.start)}</b></div><div><span>终点</span><b>{pointText(plan.end)}</b></div><div><span>航点</span><b>{plan.waypoints.length} 个</b></div><div><span>禁飞区</span><b>{plan.noFlyZones.length} 个</b></div><div><span>起飞时间</span><b>{plan.departureTime ? new Date(plan.departureTime).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '未设置'}</b></div></div></section>
           <section className="inspector-section"><div className="section-title"><span>快捷操作</span></div><button className="outline-action" onClick={() => { updatePlan({ waypoints: [] }); setNotice('已清空所有航点'); }}>清空航点</button><button className="outline-action" onClick={() => { updatePlan({ noFlyZones: [] }); setNotice('已移除所有禁飞区'); }}>移除禁飞区</button><button className="outline-action" onClick={() => setValidation(validateRoute(plan))}>重新校验路径 <span>⌘↵</span></button></section>
           <section className="api-note"><div className="api-icon">⌁</div><div><b>内存 REST API</b><small>保存到当前 Node.js 进程，重启后清空</small></div></section>
         </aside>

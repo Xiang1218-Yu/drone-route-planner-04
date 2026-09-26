@@ -15,7 +15,8 @@
     "build:frontend": "vite build --config frontend/vite.config.ts",
     "build:backend": "tsc -p backend/tsconfig.json",
     "typecheck": "tsc -p frontend/tsconfig.json --noEmit && tsc -p backend/tsconfig.json --noEmit",
-    "start": "node backend/dist/server.js"
+    "start": "node backend/dist/server.js",
+    "test": "node --import tsx --test backend/src/time.test.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

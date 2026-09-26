@@ -1,7 +1,8 @@
-import type { NoFlyZone, Point, RoutePlan } from './types.js';
+import { summarizeZoneTimes } from './time.js';
+import type { NoFlyZone, Point, RoutePlan, ZoneTimeStatus, ZoneTimeSummary } from './types.js';
 
 export type RouteIssue = {
-  type: 'out-of-bounds' | 'no-fly-zone';
+  type: 'out-of-bounds' | 'no-fly-zone' | 'no-fly-zone-unconfirmed';
   message: string;
   segmentIndex?: number;
   zoneId?: string;
@@ -11,6 +12,10 @@ export type RouteValidation = {
   valid: boolean;
   distance: number;
   issues: RouteIssue[];
+  /** 本次校验使用的计划起飞时间（原样回显） */
+  departureTime?: string;
+  /** 按起飞时刻对禁飞区的分桶：当前有效 / 已过期或未生效 / 无法确认 */
+  zones: ZoneTimeSummary;
 };
 
 const EPSILON = 1e-8;
@@ -76,6 +81,11 @@ export function validateRoute(plan: RoutePlan): RouteValidation {
   const points = routePoints(plan);
   const issues: RouteIssue[] = [];
   const { width, height } = plan.canvas;
+  const zones = summarizeZoneTimes(plan.noFlyZones, plan.departureTime);
+  const statusByZone = new Map<string, ZoneTimeStatus>();
+  for (const group of [zones.active, zones.inactive, zones.unknown]) {
+    for (const evaluation of group) statusByZone.set(evaluation.zoneId, evaluation.status);
+  }
 
   points.forEach((point, index) => {
     if (point.x < 0 || point.x > width || point.y < 0 || point.y > height) {
@@ -86,10 +96,21 @@ export function validateRoute(plan: RoutePlan): RouteValidation {
   points.slice(1).forEach((point, index) => {
     const start = points[index];
     plan.noFlyZones.forEach((zone) => {
-      if (segmentIntersectsZone(start, point, zone)) {
+      if (!segmentIntersectsZone(start, point, zone)) return;
+      const status = statusByZone.get(zone.id) ?? 'unknown';
+      if (status === 'inactive') return;
+      if (status === 'active') {
         issues.push({
           type: 'no-fly-zone',
-          message: `航段 ${index + 1} 穿越禁飞区「${zone.name}」`,
+          message: `航段 ${index + 1} 穿越生效中的禁飞区「${zone.name}」`,
+          segmentIndex: index,
+          zoneId: zone.id
+        });
+      } else {
+        // 时间无法确认的区域按有效保守处理，并明确标注，绝不静默放行
+        issues.push({
+          type: 'no-fly-zone-unconfirmed',
+          message: `航段 ${index + 1} 穿越时间未确认的禁飞区「${zone.name}」（按有效保守处理）`,
           segmentIndex: index,
           zoneId: zone.id
         });
@@ -97,5 +118,5 @@ export function validateRoute(plan: RoutePlan): RouteValidation {
     });
   });
 
-  return { valid: issues.length === 0, distance: routeDistance(points), issues };
+  return { valid: issues.length === 0, distance: routeDistance(points), issues, departureTime: plan.departureTime, zones };
 }

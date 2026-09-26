@@ -1,4 +1,5 @@
-import type { NoFlyZone, Point, RoutePlan, ValidationResult } from './types';
+import { summarizeZoneTimes } from './time';
+import type { NoFlyZone, Point, RoutePlan, ValidationResult, ZoneTimeStatus } from './types';
 
 const epsilon = 1e-8;
 
@@ -40,6 +41,11 @@ const segmentIntersectsZone = (start: Point, end: Point, zone: NoFlyZone) => {
 export function validateRoute(plan: RoutePlan): ValidationResult {
   const points = routePoints(plan);
   const issues: ValidationResult['issues'] = [];
+  const zones = summarizeZoneTimes(plan.noFlyZones, plan.departureTime);
+  const statusByZone = new Map<string, ZoneTimeStatus>();
+  for (const group of [zones.active, zones.inactive, zones.unknown]) {
+    for (const evaluation of group) statusByZone.set(evaluation.zoneId, evaluation.status);
+  }
   points.forEach((point, index) => {
     if (point.x < 0 || point.x > plan.canvas.width || point.y < 0 || point.y > plan.canvas.height) {
       issues.push({ type: 'out-of-bounds', message: `节点 ${index + 1} 超出画布范围` });
@@ -47,10 +53,16 @@ export function validateRoute(plan: RoutePlan): ValidationResult {
   });
   points.slice(1).forEach((point, segmentIndex) => {
     plan.noFlyZones.forEach((zone) => {
-      if (segmentIntersectsZone(points[segmentIndex], point, zone)) {
-        issues.push({ type: 'no-fly-zone', message: `航段 ${segmentIndex + 1} 穿越禁飞区「${zone.name}」`, segmentIndex, zoneId: zone.id });
+      if (!segmentIntersectsZone(points[segmentIndex], point, zone)) return;
+      const status = statusByZone.get(zone.id) ?? 'unknown';
+      if (status === 'inactive') return;
+      if (status === 'active') {
+        issues.push({ type: 'no-fly-zone', message: `航段 ${segmentIndex + 1} 穿越生效中的禁飞区「${zone.name}」`, segmentIndex, zoneId: zone.id });
+      } else {
+        // 时间无法确认的区域按有效保守处理，并明确标注，绝不静默放行
+        issues.push({ type: 'no-fly-zone-unconfirmed', message: `航段 ${segmentIndex + 1} 穿越时间未确认的禁飞区「${zone.name}」（按有效保守处理）`, segmentIndex, zoneId: zone.id });
       }
     });
   });
-  return { valid: issues.length === 0, distance: routeDistance(points), issues };
+  return { valid: issues.length === 0, distance: routeDistance(points), issues, departureTime: plan.departureTime, zones };
 }
